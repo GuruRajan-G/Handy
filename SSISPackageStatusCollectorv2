@@ -1,0 +1,324 @@
+/********
+1) Return information about packages stored on your hard drive
+2) Returna  list of GUIDs that are duplicated throughout your packages
+
+Jamie Thomson
+2009-11-06
+
+See notes at bottom for more info
+********/
+sp_configure 'show advanced options', 1;
+reconfigure;
+GO
+sp_configure 'xp_cmdshell', 1;
+reconfigure;
+GO
+
+use tempdb
+go
+DECLARE	@Path	VARCHAR(2000); 
+SET @Path = 'C:\*.dtsx'; --Must be of form [drive letter]\...\*.dtsx
+
+DECLARE	@MyFiles TABLE (MyID INT IDENTITY(1,1) PRIMARY KEY, FullPath VARCHAR(2000));
+DECLARE	@CommandLine VARCHAR(4000) ;
+
+SELECT	@CommandLine =LEFT('dir "' + @Path + '" /A-D /B /S ',4000);
+INSERT	INTO @MyFiles (FullPath) 
+EXECUTE	xp_cmdshell @CommandLine;
+DELETE
+FROM	@MyFiles
+WHERE	FullPath IS NULL 
+OR		FullPath='File Not Found' 
+OR		FullPath = 'The system cannot find the path specified.'
+OR		FullPath = 'The system cannot find the file specified.'; 
+
+--pkgStats needs to be a proper table (rather than a table variable) because we later use it in dynamic SQL
+IF EXISTS (select * from sys.tables where name = N'pkgStats')
+		DROP	TABLE pkgStats;
+CREATE	 TABLE pkgStats(
+		PackagePath	varchar(900)	NOT NULL PRIMARY KEY
+,		PackageXML	XML				NOT NULL
+);
+
+DECLARE	@FullPath	varchar(2000);
+DECLARE	file_cursor CURSOR
+FOR		SELECT FullPath FROM @MyFiles;
+OPEN	file_cursor
+FETCH	NEXT FROM file_cursor INTO @FullPath;
+WHILE	@@FETCH_STATUS = 0
+BEGIN
+		--Needs to be dynamic SQL because OPENROWSET won't take a variable as an argument
+		declare	@sql	nvarchar(max);
+		SET @sql = '
+		INSERT	pkgStats (PackagePath,PackageXML)
+		select  ''@FullPath'' as PackagePath
+		,		cast(BulkColumn as XML) as PackageXML
+		from    openrowset(bulk ''@FullPath'',
+								single_blob) as pkgColumn';
+		SELECT	@sql = REPLACE(@sql, '@FullPath', @FullPath);
+		EXEC	sp_executesql @sql;
+		
+		FETCH	NEXT FROM file_cursor INTO @FullPath;
+END
+CLOSE	file_cursor;
+DEALLOCATE file_cursor;
+
+declare	@pkgStatsBase TABLE (
+		PackagePath				varchar(900)
+,		PackageId				uniqueidentifier
+,		CreatorName				nvarchar(500)
+,		PackageFormatVersion	smallint
+,		PackageType				nvarchar(50)
+,		PackageDescription		nvarchar(2000)
+,		VersionMajor			smallint
+,		VersionMinor			smallint
+,		VersionBuild			smallint
+,		VersionGUID				uniqueidentifier
+,		PackageXML				XML
+);
+
+insert	into @pkgStatsBase
+select	PackagePath
+,		CAST(PackageXML.value('declare namespace DTS="www.microsoft.com/SqlServer/Dts";
+							/DTS:Executable[1]/DTS:Property[@DTS:Name=''DTSID''][1]','nvarchar(500)') AS uniqueidentifier) AS PackageID
+,		PackageXML.value('declare namespace DTS="www.microsoft.com/SqlServer/Dts";
+							/DTS:Executable[1]/DTS:Property[@DTS:Name=''CreatorName''][1]','nvarchar(500)') AS CreatorName
+,		CAST(PackageXML.value('declare namespace DTS="www.microsoft.com/SqlServer/Dts";
+							/DTS:Executable[1]/DTS:Property[@DTS:Name=''PackageFormatVersion''][1]','varchar(3)') AS smallint) AS PackageFormatVersion
+,		CAST(PackageXML.value('declare namespace DTS="www.microsoft.com/SqlServer/Dts";
+							DTS:Executable[1]/@DTS:ExecutableType[1]','nvarchar(50)') AS nvarchar(50)) AS PackageType
+,		PackageXML.value('declare namespace DTS="www.microsoft.com/SqlServer/Dts";
+							/DTS:Executable[1]/DTS:Property[@DTS:Name=''Description''][1]','nvarchar(2000)') AS PackageDescription
+,		CAST(PackageXML.value('declare namespace DTS="www.microsoft.com/SqlServer/Dts";
+							/DTS:Executable[1]/DTS:Property[@DTS:Name=''VersionMajor''][1]','varchar(3)') AS smallint) AS VersionMajor
+,		CAST(PackageXML.value('declare namespace DTS="www.microsoft.com/SqlServer/Dts";
+							/DTS:Executable[1]/DTS:Property[@DTS:Name=''VersionMinor''][1]','varchar(3)') AS smallint) AS VersionMinor
+,		CAST(PackageXML.value('declare namespace DTS="www.microsoft.com/SqlServer/Dts";
+							/DTS:Executable[1]/DTS:Property[@DTS:Name=''VersionBuild''][1]','varchar(3)') AS smallint) AS VersionBuild
+,		CAST(PackageXML.value('declare namespace DTS="www.microsoft.com/SqlServer/Dts";
+							/DTS:Executable[1]/DTS:Property[@DTS:Name=''VersionGUID''][1]','char(38)') AS uniqueidentifier) AS VersionGUID
+,		PackageXML
+from	pkgStats
+
+declare	@AllpkgStats TABLE (
+		PackageId							uniqueidentifier			not null
+,		PackagePath							varchar(900) primary key	not null
+,		PackageName							varchar(900)				not null
+,		CreatorName							nvarchar(500)				not null
+,		PackageFormatVersion				smallint					not null
+,		PackageType							nvarchar(50)				not null
+,		PackageDescription					nvarchar(2000)				not null
+,		VersionMajor						smallint					not null
+,		VersionMinor						smallint					not null
+,		VersionBuild						smallint					not null
+,		VersionGUID							uniqueidentifier			not null
+,		NumberOfTasks						int							null
+,		NumberOfContainers					int							null
+,		NumberOfDataflows					int							null
+,		NumberOfConnectionManagers			int							null
+,		NumberOfVariablesInEntirePackage	int							null
+,		PackageXML							XML							not null
+);
+
+INSERT	INTO @AllpkgStats (PackageId,PackagePath,PackageName,CreatorName,PackageFormatVersion,PackageType,PackageDescription,VersionMajor,VersionMinor,VersionBuild,VersionGUID,PackageXML)
+SELECT	p.PackageId
+,		p.PackagePath
+,		SUBSTRING(PackagePath,LEN(PackagePath) - CHARINDEX('\',REVERSE(PackagePath),0)+2,LEN(PackagePath)) AS PackageName
+,		p.CreatorName
+,		p.PackageFormatVersion
+,		p.PackageType
+,		p.PackageDescription
+,		p.VersionMajor
+,		p.VersionMinor
+,		p.VersionBuild
+,		p.VersionGUID
+,		p.PackageXML
+FROM	@pkgStatsBase p
+;
+--Number of tasks
+MERGE	INTO @AllPkgStats AS t
+USING	(
+		SELECT	PackagePath
+		,		COUNT(*) AS NumberOfTasks
+		FROM	@pkgStatsBase p
+		CROSS    APPLY p.PackageXML.nodes('declare namespace DTS="www.microsoft.com/SqlServer/Dts";
+									//DTS:Executable[@DTS:ExecutableType!=''STOCK:SEQUENCE''
+								and    @DTS:ExecutableType!=''STOCK:FORLOOP''
+								and    @DTS:ExecutableType!=''STOCK:FOREACHLOOP''
+								and not(contains(@DTS:ExecutableType,''.Package.''))]') Pkg(props)
+		GROUP	BY
+				PackagePath
+		)s
+ON		(t.PackagePath = s.PackagePath)
+WHEN MATCHED THEN 
+		UPDATE	SET NumberOfTasks = s.NumberOfTasks;
+
+--Number of containers
+MERGE	INTO @AllPkgStats AS t
+USING	(
+		SELECT	PackagePath
+		,		COUNT(*) AS NumberOfContainers
+		FROM	@pkgStatsBase p
+		CROSS    APPLY p.PackageXML.nodes('declare namespace DTS="www.microsoft.com/SqlServer/Dts";
+									//DTS:Executable[@DTS:ExecutableType=''STOCK:SEQUENCE''
+									or    @DTS:ExecutableType=''STOCK:FORLOOP''
+									or    @DTS:ExecutableType=''STOCK:FOREACHLOOP'']') Pkg(props)
+		GROUP	BY
+				PackagePath
+		)s
+ON		(t.PackagePath = s.PackagePath)
+WHEN MATCHED THEN 
+		UPDATE	SET NumberOfContainers = s.NumberOfContainers
+WHEN NOT MATCHED BY SOURCE THEN
+		UPDATE	SET NumberOfContainers = 0;
+
+--Number of dataflows		
+MERGE	INTO @AllPkgStats AS t
+USING	(
+		SELECT	PackagePath
+		,		COUNT(*) AS NumberOfDataflows
+		FROM	@pkgStatsBase p
+		CROSS    APPLY p.PackageXML.nodes('declare namespace DTS="www.microsoft.com/SqlServer/Dts";
+									//DTS:Executable[contains(@DTS:ExecutableType,''.Pipeline.'')]') Pkg(props)
+
+		GROUP	BY
+				PackagePath
+		)s
+ON		(t.PackagePath = s.PackagePath)
+WHEN MATCHED THEN 
+		UPDATE	SET NumberOfDataflows = s.NumberOfDataflows
+WHEN NOT MATCHED BY SOURCE THEN
+		UPDATE	SET NumberOfDataflows = 0;
+
+--Number of connection managers
+MERGE	INTO @AllPkgStats AS t
+USING	(
+		SELECT	PackagePath
+		,		COUNT(*) AS NumberOfConnectionManagers
+		FROM	@pkgStatsBase p
+		CROSS    APPLY p.PackageXML.nodes('declare namespace DTS="www.microsoft.com/SqlServer/Dts";
+									//DTS:ConnectionManager') Pkg(props)
+
+		GROUP	BY
+				PackagePath
+		)s
+ON		(t.PackagePath = s.PackagePath)
+WHEN MATCHED THEN 
+		UPDATE	SET NumberOfConnectionManagers = s.NumberOfConnectionManagers
+WHEN NOT MATCHED BY SOURCE THEN
+		UPDATE	SET NumberOfConnectionManagers = 0;
+
+--Number of variables in entire package
+/*N.B. This will return all user variables plus any system variables that have been set by the developer
+e.g.  System::Propogate is a system variable but its value can still be set by the developer
+
+Variables in eventhandlers are not excluded, if they exist they will be included in this count too.
+*/
+MERGE	INTO @AllPkgStats AS t
+USING	(
+		SELECT	PackagePath
+		,		COUNT(*) AS NumberOfVariablesInEntirePackage
+		FROM	@pkgStatsBase p
+		CROSS    APPLY p.PackageXML.nodes('declare namespace DTS="www.microsoft.com/SqlServer/Dts";
+									//DTS:Variable') Pkg(props)
+
+		GROUP	BY
+				PackagePath
+		)s
+ON		(t.PackagePath = s.PackagePath)
+WHEN MATCHED THEN 
+		UPDATE	SET NumberOfVariablesInEntirePackage = s.NumberOfVariablesInEntirePackage
+WHEN NOT MATCHED BY SOURCE THEN
+		UPDATE	SET NumberOfVariablesInEntirePackage = 0;
+
+SELECT	*
+FROM	@AllpkgStats
+ORDER	BY NumberOfTasks DESC;
+
+
+
+
+
+
+--Return any repeated GUIDs. Ideally this should return 0 rows!!!!
+with	guidCte as
+(
+		select	p.PackagePath
+		,		props.value('.','nvarchar(max)') _guid
+		,		p.PackageXML
+		from	@pkgStatsBase p
+		CROSS    APPLY p.PackageXML.nodes('declare namespace DTS="www.microsoft.com/SqlServer/Dts";
+									//DTS:Property[@DTS:Name=''DTSID'']') Pkg(props)
+)
+select	q._guid,q.PackagePath,q.NumberOfTimesThisGUIDOccursInThisPackage,p.PackageXML
+from	(
+		select	g._guid,g.PackagePath,COUNT(*) NumberOfTimesThisGUIDOccursInThisPackage
+		from	guidCte g
+		inner	join (
+				select	_guid
+				from	guidCte
+				group	by _guid
+				having	COUNT(*) > 1
+				)repeated
+		on		g._guid = repeated._guid
+		group	by g._guid,g.PackagePath
+		)q
+inner	join @pkgStatsBase p
+on		q.PackagePath = p.PackagePath
+order	by _guid
+;
+
+/*
+--Basic capture of package XML:
+declare	@sql	nvarchar(max);
+DECLARE	@FullPath	varchar(2000) = 'FILEPATH HERE!!!!';
+SET @sql = '
+select  ''@FullPath'' as PackagePath
+,		cast(BulkColumn as XML) as PackageXML
+from    openrowset(bulk ''@FullPath'',
+						single_blob) as pkgColumn';
+SELECT	@sql = REPLACE(@sql, '@FullPath', @FullPath);
+EXEC	sp_executesql @sql;
+
+=======
+Summary
+=======
+
+For a blow by blow history head for http://sqlblog.com/blogs/jamie_thomson/archive/tags/SSISPackageStatsCollector/default.aspx
+
+===============
+Version history
+===============
+
+Version 1
+=========
+Returns following columns:
+	PackageName
+	PackagePath
+	CretorName
+	PackageFormatVersion
+	PackageType
+	PackageDescription
+	VersionMajor
+	VersionMinor
+	VersionBuild
+	VersionGUID
+	NumberOfTasks
+Version 2
+=========
+New columns:
+	PackageId
+	PackageXML
+	NumberOfContainers
+	NumberOfDataflows
+	NumberOfConnectionManagers
+	NumberOfVariablesInEntirePackage
+New features:
+	Returns a list of non-unique GUIDs and the packages that they apepar in. If a GUID appears more 
+		than once in the same package it tells us how many times
+Bug fix:
+	If there were no tasks in the package no data would be returned. That is now no longer the case.
+	Previous version didn’t work on case-sensitive collations, should be OK now.
+	
+
+*/
